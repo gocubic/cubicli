@@ -91,6 +91,7 @@ export class TUIApp {
     // Start render loop with stats and state updates
     this.renderInterval = setInterval(async () => {
       this.state.appState = await loadState();
+      await this.refreshGitStatus();
       await processManager.updateStats();
       this.render();
     }, 1000);
@@ -122,6 +123,14 @@ export class TUIApp {
         ...project,
         git: await getGitStatus(project.path),
       }))
+    );
+  }
+
+  private async refreshGitStatus(): Promise<void> {
+    await Promise.all(
+      this.state.projects.map(async (project) => {
+        project.git = await getGitStatus(project.path);
+      })
     );
   }
 
