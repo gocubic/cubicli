@@ -29,7 +29,7 @@ export const PROJECTS: Project[] = [
 ];
 
 export const APPS: AppConfig[] = [
-  { name: 'api', port: 3000, command: 'nx serve api' },
+  { name: 'api', port: 5555, command: 'nx serve api' },
   { name: 'client-app', port: 4200, command: 'nx serve client-app' },
   { name: 'mycelium', port: 4201, command: 'nx serve mycelium' },
 ];

@@ -2,7 +2,7 @@ import treeKill from 'tree-kill';
 import { appendFile, readFile, writeFile, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
 import { APPS, LOG_DIR, type AppConfig, type DopplerConfig, type Project } from '../config/projects';
-import { loadState, saveState, isProcessRunning, getProcessStats, type AppState, type ProcessInfo, type ProcessStats } from './state';
+import { loadState, saveState, isProcessRunning, getProcessStats, ensurePortsAvailable, resetNxDaemon, type AppState, type ProcessInfo, type ProcessStats } from './state';
 
 const MAX_LOG_LINES = 10000;
 
@@ -153,6 +153,13 @@ export class ProcessManager {
   }
 
   async startAll(project: Project, dopplerConfig: DopplerConfig): Promise<void> {
+    // Ensure all required ports are available before starting
+    const requiredPorts = APPS.map((app) => app.port);
+    await ensurePortsAvailable(requiredPorts);
+
+    // Reset nx daemon to clear any stale state from previous runs
+    await resetNxDaemon(project.path);
+
     // Clear log buffers
     for (const app of APPS) {
       this.clearLogBuffer(app.name);

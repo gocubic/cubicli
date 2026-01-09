@@ -43,6 +43,7 @@ export class TUIApp {
       searchQuery: '',
       searchMatches: [],
       searchMatchIndex: 0,
+      quitConfirmMode: false,
       projects: [],
       appState: {
         activeProject: null,
@@ -112,6 +113,11 @@ export class TUIApp {
       clearInterval(this.renderInterval);
     }
 
+    // Kill all running processes before exiting
+    if (processManager.isRunning()) {
+      await processManager.stopAll();
+    }
+
     // Restore terminal
     showCursor();
     restoreScreen();
@@ -144,9 +150,16 @@ export class TUIApp {
   }
 
   private async handleKeypress(key: string): Promise<void> {
-    // Handle Ctrl+C
+    // Handle Ctrl+C - always show quit confirmation
     if (key === '\x03') {
-      await this.quit();
+      this.state.quitConfirmMode = true;
+      this.render();
+      return;
+    }
+
+    // Handle quit confirmation mode
+    if (this.state.quitConfirmMode) {
+      await this.handleQuitConfirmKeypress(key);
       return;
     }
 
@@ -161,6 +174,21 @@ export class TUIApp {
     }
 
     await this.handleDashboardKeypress(key);
+  }
+
+  private async handleQuitConfirmKeypress(key: string): Promise<void> {
+    switch (key) {
+      case 'y':
+      case 'Y':
+        await this.quit();
+        break;
+      case 'n':
+      case 'N':
+      case '\x1b': // Escape
+        this.state.quitConfirmMode = false;
+        break;
+    }
+    this.render();
   }
 
   private async handleDashboardKeypress(key: string): Promise<void> {
@@ -201,7 +229,7 @@ export class TUIApp {
         break;
 
       case 'q':
-        await this.quit();
+        this.state.quitConfirmMode = true;
         break;
     }
     this.render();
@@ -296,8 +324,8 @@ export class TUIApp {
         break;
 
       case 'q':
-        await this.quit();
-        return;
+        this.state.quitConfirmMode = true;
+        break;
     }
     this.render();
   }
@@ -431,12 +459,58 @@ export class TUIApp {
     if (!this.running) return;
 
     moveCursorHome();
-    const lines =
-      this.state.viewMode === 'dashboard' ? this.renderDashboard() : this.renderLogViewer();
+    let lines: string[];
+
+    if (this.state.quitConfirmMode) {
+      lines = this.renderQuitConfirmation();
+    } else if (this.state.viewMode === 'dashboard') {
+      lines = this.renderDashboard();
+    } else {
+      lines = this.renderLogViewer();
+    }
 
     for (const line of lines) {
       writeLine(line);
     }
+  }
+
+  private renderQuitConfirmation(): string[] {
+    const width = this.state.terminalWidth;
+    const height = this.state.terminalHeight;
+    const lines: string[] = [];
+
+    // Fill with empty lines to center the dialog
+    const dialogHeight = 7;
+    const topPadding = Math.floor((height - dialogHeight) / 2);
+
+    for (let i = 0; i < topPadding; i++) {
+      lines.push(' '.repeat(width));
+    }
+
+    // Dialog box
+    const dialogWidth = 40;
+    const leftPadding = Math.floor((width - dialogWidth) / 2);
+    const pad = ' '.repeat(leftPadding);
+
+    lines.push(pad + drawBoxTop(dialogWidth));
+    lines.push(pad + `${BOX.vertical}${' '.repeat(dialogWidth - 2)}${BOX.vertical}`);
+    const title = colors.warning('  Quit cubicli?');
+    lines.push(pad + `${BOX.vertical}${padString(title, dialogWidth - 2)}${BOX.vertical}`);
+    lines.push(pad + `${BOX.vertical}${' '.repeat(dialogWidth - 2)}${BOX.vertical}`);
+    const prompt = '  All processes will be stopped.';
+    lines.push(pad + `${BOX.vertical}${padString(prompt, dialogWidth - 2)}${BOX.vertical}`);
+    lines.push(pad + `${BOX.vertical}${' '.repeat(dialogWidth - 2)}${BOX.vertical}`);
+    const options = `  ${colors.key('[y]')} Yes  ${colors.key('[n]')} No`;
+    lines.push(pad + `${BOX.vertical}${padString(options, dialogWidth - 2)}${BOX.vertical}`);
+    lines.push(pad + `${BOX.vertical}${' '.repeat(dialogWidth - 2)}${BOX.vertical}`);
+    lines.push(pad + drawBoxBottom(dialogWidth));
+
+    // Fill remaining lines
+    while (lines.length < height) {
+      lines.push(' '.repeat(width));
+    }
+
+    return lines;
   }
 
   private renderDashboard(): string[] {
@@ -594,7 +668,9 @@ export class TUIApp {
 
     // Title bar
     lines.push(drawBoxTop(width));
-    const title = colors.title(`  LOGS: ${app.name}`);
+    const projectName = this.state.appState.activeProject || 'none';
+    const configName = this.state.appState.dopplerConfig;
+    const title = colors.title(`  LOGS: ${projectName} › ${app.name}`) + colors.dim(` (${configName})`);
     const appIndicator = `[${this.state.selectedLogApp + 1}/${APPS.length}]`;
     const followIndicator = this.state.logFollowMode ? colors.success('FOLLOW ●') : '';
     const searchIndicator = this.state.searchMode

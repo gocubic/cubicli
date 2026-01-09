@@ -18,6 +18,7 @@ export interface AppUIState {
   searchQuery: string;
   searchMatches: number[];
   searchMatchIndex: number;
+  quitConfirmMode: boolean;
   projects: ProjectWithGit[];
   appState: AppState;
   terminalWidth: number;
