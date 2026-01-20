@@ -16,7 +16,7 @@ export class ProcessManager {
   private adoptedPids: Map<string, number> = new Map(); // PIDs of processes we didn't spawn
   private logBuffers: Map<string, LogBuffer> = new Map();
   private processStats: Map<string, ProcessStats> = new Map();
-  private onLogUpdate?: (appName: string, line: string) => void;
+  private onLogUpdate?: (appName: string, line: string, didShift: boolean) => void;
   private truncateCounter = 0;
 
   constructor() {
@@ -121,7 +121,7 @@ export class ProcessManager {
     }
   }
 
-  setLogUpdateHandler(handler: (appName: string, line: string) => void): void {
+  setLogUpdateHandler(handler: (appName: string, line: string, didShift: boolean) => void): void {
     this.onLogUpdate = handler;
   }
 
@@ -135,21 +135,25 @@ export class ProcessManager {
     writeFile(this.getLogFilePath(appName), '').catch(() => {});
   }
 
-  private addLogLine(appName: string, line: string): void {
+  private addLogLine(appName: string, line: string): boolean {
     const buffer = this.logBuffers.get(appName);
-    if (!buffer) return;
+    if (!buffer) return false;
 
     buffer.lines.push(line);
 
     // Ring buffer - remove oldest if over limit
+    let didShift = false;
     if (buffer.lines.length > MAX_LOG_LINES) {
       buffer.lines.shift();
+      didShift = true;
     }
 
     // Persist to file (fire and forget)
     this.appendToLogFile(appName, line);
 
-    this.onLogUpdate?.(appName, line);
+    this.onLogUpdate?.(appName, line, didShift);
+
+    return didShift;
   }
 
   async startAll(project: Project, dopplerConfig: DopplerConfig): Promise<void> {

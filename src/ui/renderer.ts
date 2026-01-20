@@ -14,6 +14,10 @@ export const showCursor = () => process.stdout.write(`${CSI}?25h`);
 export const saveScreen = () => process.stdout.write(`${CSI}?1049h`);
 export const restoreScreen = () => process.stdout.write(`${CSI}?1049l`);
 
+// Mouse tracking (SGR mode for better compatibility)
+export const enableMouseTracking = () => process.stdout.write(`${CSI}?1000h${CSI}?1006h`);
+export const disableMouseTracking = () => process.stdout.write(`${CSI}?1006l${CSI}?1000l`);
+
 // Get terminal dimensions
 export function getTerminalSize(): { rows: number; cols: number } {
   return {

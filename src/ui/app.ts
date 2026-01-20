@@ -23,6 +23,8 @@ import {
   BOX,
   write,
   writeLine,
+  enableMouseTracking,
+  disableMouseTracking,
 } from './renderer';
 import type { AppUIState, ProjectWithGit, ViewMode } from './types';
 
@@ -30,6 +32,7 @@ export class TUIApp {
   private state: AppUIState;
   private running = false;
   private renderInterval?: Timer;
+  private mouseTrackingEnabled = false;
 
   constructor() {
     const { rows, cols } = getTerminalSize();
@@ -81,10 +84,22 @@ export class TUIApp {
     this.setupKeyboardInput();
 
     // Setup log update handler
-    processManager.setLogUpdateHandler(() => {
-      if (this.state.viewMode === 'logs' && this.state.logFollowMode) {
-        const buffer = processManager.getLogBuffer(APPS[this.state.selectedLogApp].name);
-        this.state.logScrollOffset = Math.max(0, buffer.lines.length - this.getLogViewHeight());
+    processManager.setLogUpdateHandler((appName: string, _line: string, didShift: boolean) => {
+      if (this.state.viewMode === 'logs') {
+        const currentApp = APPS[this.state.selectedLogApp].name;
+        if (appName === currentApp) {
+          if (this.state.logFollowMode) {
+            const buffer = processManager.getLogBuffer(currentApp);
+            this.state.logScrollOffset = Math.max(0, buffer.lines.length - this.getLogViewHeight());
+          } else if (didShift && this.state.logScrollOffset > 0) {
+            // Adjust offset to keep the same content in view when buffer shifts
+            this.state.logScrollOffset = Math.max(0, this.state.logScrollOffset - 1);
+          }
+        }
+        // Skip render when follow mode is off (allows text selection)
+        if (!this.state.logFollowMode) {
+          return;
+        }
       }
       this.render();
     });
@@ -94,6 +109,12 @@ export class TUIApp {
       this.state.appState = await loadState();
       await this.refreshGitStatus();
       await processManager.updateStats();
+
+      // Skip render when in logs view with follow mode off (allows text selection)
+      if (this.state.viewMode === 'logs' && !this.state.logFollowMode) {
+        return;
+      }
+
       this.render();
     }, 1000);
     this.render();
@@ -119,6 +140,10 @@ export class TUIApp {
     }
 
     // Restore terminal
+    if (this.mouseTrackingEnabled) {
+      disableMouseTracking();
+      this.mouseTrackingEnabled = false;
+    }
     showCursor();
     restoreScreen();
   }
@@ -149,7 +174,27 @@ export class TUIApp {
     process.stdin.on('data', (key: string) => this.handleKeypress(key));
   }
 
+  private updateMouseTracking(): void {
+    const shouldEnable = this.state.viewMode === 'logs' && this.state.logFollowMode;
+    if (shouldEnable && !this.mouseTrackingEnabled) {
+      enableMouseTracking();
+      this.mouseTrackingEnabled = true;
+    } else if (!shouldEnable && this.mouseTrackingEnabled) {
+      disableMouseTracking();
+      this.mouseTrackingEnabled = false;
+    }
+  }
+
   private async handleKeypress(key: string): Promise<void> {
+    // Handle mouse events (SGR mode: \x1b[<button;x;yM or m)
+    // When mouse is clicked in log view, disable follow mode to allow text selection
+    if (key.startsWith('\x1b[<') && this.state.viewMode === 'logs') {
+      this.state.logFollowMode = false;
+      this.updateMouseTracking();
+      this.render(); // Update the follow indicator
+      return;
+    }
+
     // Handle Ctrl+C - always show quit confirmation
     if (key === '\x03') {
       this.state.quitConfirmMode = true;
@@ -160,20 +205,24 @@ export class TUIApp {
     // Handle quit confirmation mode
     if (this.state.quitConfirmMode) {
       await this.handleQuitConfirmKeypress(key);
+      this.updateMouseTracking();
       return;
     }
 
     if (this.state.searchMode) {
       await this.handleSearchKeypress(key);
+      this.updateMouseTracking();
       return;
     }
 
     if (this.state.viewMode === 'logs') {
       await this.handleLogKeypress(key);
+      this.updateMouseTracking();
       return;
     }
 
     await this.handleDashboardKeypress(key);
+    this.updateMouseTracking();
   }
 
   private async handleQuitConfirmKeypress(key: string): Promise<void> {
