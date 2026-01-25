@@ -1,5 +1,5 @@
 import chalk from 'chalk';
-import { PROJECTS, APPS, DOPPLER_CONFIGS, type DopplerConfig } from '../config/projects';
+import { PROJECTS, APPS, DOPPLER_CONFIGS, getPortForApp, type DopplerConfig } from '../config/projects';
 import { loadState, verifyRunningProcesses, type AppState } from '../services/state';
 import { getGitStatus } from '../services/git';
 import { processManager } from '../services/process-manager';
@@ -14,14 +14,12 @@ import {
   drawBoxTop,
   drawBoxBottom,
   drawHorizontalLine,
-  drawRow,
   padString,
   truncateString,
   stripAnsi,
   colors,
   STATUS,
   BOX,
-  write,
   writeLine,
   enableMouseTracking,
   disableMouseTracking,
@@ -40,6 +38,7 @@ export class TUIApp {
       viewMode: 'dashboard',
       selectedProjectIndex: 0,
       selectedLogApp: 0,
+      selectedLogProject: 0,
       logScrollOffset: 0,
       logFollowMode: true,
       searchMode: false,
@@ -49,10 +48,8 @@ export class TUIApp {
       quitConfirmMode: false,
       projects: [],
       appState: {
-        activeProject: null,
         dopplerConfig: 'dev',
-        startedAt: null,
-        processes: {},
+        activeProjects: {},
       },
       terminalWidth: cols,
       terminalHeight: rows,
@@ -74,9 +71,10 @@ export class TUIApp {
     // Adopt any running processes from previous session
     await processManager.adoptRunningProcesses();
 
-    // Set the selected project to the active one if any
-    if (this.state.appState.activeProject) {
-      const idx = this.state.projects.findIndex(p => p.alias === this.state.appState.activeProject);
+    // Set the selected project to the first active one if any
+    const activeAliases = Object.keys(this.state.appState.activeProjects);
+    if (activeAliases.length > 0) {
+      const idx = this.state.projects.findIndex(p => activeAliases.includes(p.alias));
       if (idx >= 0) this.state.selectedProjectIndex = idx;
     }
 
@@ -84,12 +82,13 @@ export class TUIApp {
     this.setupKeyboardInput();
 
     // Setup log update handler
-    processManager.setLogUpdateHandler((appName: string, _line: string, didShift: boolean) => {
+    processManager.setLogUpdateHandler((projectAlias: string, appName: string, _line: string, didShift: boolean) => {
       if (this.state.viewMode === 'logs') {
+        const currentProject = this.state.projects[this.state.selectedLogProject];
         const currentApp = APPS[this.state.selectedLogApp].name;
-        if (appName === currentApp) {
+        if (currentProject && projectAlias === currentProject.alias && appName === currentApp) {
           if (this.state.logFollowMode) {
-            const buffer = processManager.getLogBuffer(currentApp);
+            const buffer = processManager.getLogBuffer(currentProject.alias, currentApp);
             this.state.logScrollOffset = Math.max(0, buffer.lines.length - this.getLogViewHeight());
           } else if (didShift && this.state.logScrollOffset > 0) {
             // Adjust offset to keep the same content in view when buffer shifts
@@ -136,7 +135,7 @@ export class TUIApp {
 
     // Kill all running processes before exiting
     if (processManager.isRunning()) {
-      await processManager.stopAll();
+      await processManager.stopAllProjects();
     }
 
     // Restore terminal
@@ -255,8 +254,19 @@ export class TUIApp {
         );
         break;
 
-      case '\r': // Enter
-        await this.switchToSelectedProject();
+      // Number keys for quick project selection
+      case '1':
+        if (this.state.projects.length >= 1) this.state.selectedProjectIndex = 0;
+        break;
+      case '2':
+        if (this.state.projects.length >= 2) this.state.selectedProjectIndex = 1;
+        break;
+      case '3':
+        if (this.state.projects.length >= 3) this.state.selectedProjectIndex = 2;
+        break;
+
+      case '\r': // Enter - toggle start/stop for selected project
+        await this.toggleSelectedProject();
         break;
 
       case 'c':
@@ -264,15 +274,20 @@ export class TUIApp {
         break;
 
       case 'r':
-        await this.restartProject();
+        await this.restartSelectedProject();
         break;
 
-      case 's':
-        await this.stopProject();
+      case 'A': // Shift+A - Start all projects
+        await this.startAllProjects();
+        break;
+
+      case 'S': // Shift+S - Stop all projects
+        await this.stopAllProjects();
         break;
 
       case 'l':
         this.state.viewMode = 'logs';
+        this.state.selectedLogProject = this.state.selectedProjectIndex;
         this.state.logScrollOffset = 0;
         this.state.logFollowMode = true;
         break;
@@ -285,7 +300,10 @@ export class TUIApp {
   }
 
   private async handleLogKeypress(key: string): Promise<void> {
-    const buffer = processManager.getLogBuffer(APPS[this.state.selectedLogApp].name);
+    const currentProject = this.state.projects[this.state.selectedLogProject];
+    const buffer = currentProject
+      ? processManager.getLogBuffer(currentProject.alias, APPS[this.state.selectedLogApp].name)
+      : { lines: [], searchMatches: [] };
     const viewHeight = this.getLogViewHeight();
 
     switch (key) {
@@ -325,14 +343,26 @@ export class TUIApp {
         }
         break;
 
-      case '\x1b[D': // Left arrow
+      case '\x1b[D': // Left arrow - switch app
         this.state.selectedLogApp = Math.max(0, this.state.selectedLogApp - 1);
         this.state.logScrollOffset = 0;
         this.state.logFollowMode = true;
         break;
 
-      case '\x1b[C': // Right arrow
+      case '\x1b[C': // Right arrow - switch app
         this.state.selectedLogApp = Math.min(APPS.length - 1, this.state.selectedLogApp + 1);
+        this.state.logScrollOffset = 0;
+        this.state.logFollowMode = true;
+        break;
+
+      case '[': // Switch to previous project
+        this.state.selectedLogProject = Math.max(0, this.state.selectedLogProject - 1);
+        this.state.logScrollOffset = 0;
+        this.state.logFollowMode = true;
+        break;
+
+      case ']': // Switch to next project
+        this.state.selectedLogProject = Math.min(this.state.projects.length - 1, this.state.selectedLogProject + 1);
         this.state.logScrollOffset = 0;
         this.state.logFollowMode = true;
         break;
@@ -406,7 +436,13 @@ export class TUIApp {
   }
 
   private performSearch(): void {
-    const buffer = processManager.getLogBuffer(APPS[this.state.selectedLogApp].name);
+    const currentProject = this.state.projects[this.state.selectedLogProject];
+    if (!currentProject) {
+      this.state.searchMatches = [];
+      return;
+    }
+
+    const buffer = processManager.getLogBuffer(currentProject.alias, APPS[this.state.selectedLogApp].name);
     const query = this.state.searchQuery.toLowerCase();
 
     if (!query) {
@@ -436,21 +472,20 @@ export class TUIApp {
     return this.state.terminalHeight - 6; // Header + footer + borders
   }
 
-  private async switchToSelectedProject(): Promise<void> {
+  /**
+   * Toggle start/stop for the selected project
+   */
+  private async toggleSelectedProject(): Promise<void> {
     const project = this.state.projects[this.state.selectedProjectIndex];
+    if (!project) return;
 
-    // If same project is already running, do nothing
-    if (this.state.appState.activeProject === project.alias) {
-      return;
+    if (processManager.isProjectRunning(project.alias)) {
+      // Stop the project
+      await processManager.stopProject(project.alias);
+    } else {
+      // Start the project
+      await processManager.startProject(project, this.state.appState.dopplerConfig);
     }
-
-    // Stop current if running
-    if (processManager.isRunning()) {
-      await processManager.stopAll();
-    }
-
-    // Start new project
-    await processManager.startAll(project, this.state.appState.dopplerConfig);
     this.state.appState = await loadState();
   }
 
@@ -461,42 +496,46 @@ export class TUIApp {
 
     this.state.appState.dopplerConfig = newConfig;
 
-    // If running, restart with new config
-    if (processManager.isRunning() && this.state.appState.activeProject) {
-      const project = this.state.projects.find(p => p.alias === this.state.appState.activeProject);
+    // If any projects are running, restart them with new config
+    const runningProjects = processManager.getRunningProjects();
+    for (const alias of runningProjects) {
+      const project = this.state.projects.find(p => p.alias === alias);
       if (project) {
-        await processManager.restartAll(project, newConfig);
-        this.state.appState = await loadState();
+        await processManager.restartProject(project, newConfig);
       }
     }
+    this.state.appState = await loadState();
   }
 
-  private async restartProject(): Promise<void> {
-    if (!this.state.appState.activeProject) return;
+  private async restartSelectedProject(): Promise<void> {
+    const project = this.state.projects[this.state.selectedProjectIndex];
+    if (!project || !processManager.isProjectRunning(project.alias)) return;
 
-    const project = this.state.projects.find(p => p.alias === this.state.appState.activeProject);
-    if (project) {
-      await processManager.restartAll(project, this.state.appState.dopplerConfig);
-      this.state.appState = await loadState();
-    }
+    await processManager.restartProject(project, this.state.appState.dopplerConfig);
+    this.state.appState = await loadState();
   }
 
   private async restartSelectedApp(): Promise<void> {
-    if (!this.state.appState.activeProject) return;
+    const currentProject = this.state.projects[this.state.selectedLogProject];
+    if (!currentProject) return;
 
-    const project = this.state.projects.find(p => p.alias === this.state.appState.activeProject);
+    const projectState = this.state.appState.activeProjects[currentProject.alias];
+    if (!projectState) return;
+
     const appName = APPS[this.state.selectedLogApp].name;
-    if (project) {
-      await processManager.restartApp(appName, project, this.state.appState.dopplerConfig);
-      this.state.appState = await loadState();
-    }
+    const dopplerConfig = projectState.dopplerConfig;
+    await processManager.restartApp(appName, currentProject, dopplerConfig);
+    this.state.appState = await loadState();
   }
 
-  private async stopProject(): Promise<void> {
-    if (processManager.isRunning()) {
-      await processManager.stopAll();
-      this.state.appState = await loadState();
-    }
+  private async startAllProjects(): Promise<void> {
+    await processManager.startAllProjects(this.state.appState.dopplerConfig);
+    this.state.appState = await loadState();
+  }
+
+  private async stopAllProjects(): Promise<void> {
+    await processManager.stopAllProjects();
+    this.state.appState = await loadState();
   }
 
   private async quit(): Promise<void> {
@@ -584,50 +623,108 @@ export class TUIApp {
     }
     lines.push(drawHorizontalLine(width));
 
-    // Split into two columns
-    const leftWidth = Math.floor((width - 4) / 2);
-    const rightWidth = width - 4 - leftWidth - 1;
+    // Render each project as a card
+    for (let i = 0; i < this.state.projects.length; i++) {
+      const project = this.state.projects[i];
+      const isSelected = i === this.state.selectedProjectIndex;
+      const projectState = this.state.appState.activeProjects[project.alias];
+      const isRunning = !!projectState;
 
-    // Headers
-    const projectsHeader = colors.subtitle('PROJECTS');
-    const statusHeader = colors.subtitle('STATUS');
-    lines.push(
-      `${BOX.vertical} ${padString(projectsHeader, leftWidth)}${padString(statusHeader, rightWidth)} ${BOX.vertical}`
-    );
+      // Project header line
+      const indicator = isSelected ? colors.selected('›') : ' ';
+      const runningStatus = isRunning ? STATUS.running : STATUS.stopped;
+      const projectName = project.alias.toUpperCase();
+      const branch = truncateString(project.git.branch, 20);
+      const dirty = project.git.isDirty ? colors.warning('*') : '';
+      const config = isRunning ? colors.dim(`[${projectState.dopplerConfig}]`) : '';
 
-    // Content rows
-    const maxRows = Math.max(this.state.projects.length, APPS.length);
-    for (let i = 0; i < maxRows; i++) {
-      const projectPart = this.renderProjectRow(i, leftWidth);
-      const statusPart = this.renderStatusRow(i, rightWidth);
-      lines.push(`${BOX.vertical} ${projectPart}${statusPart} ${BOX.vertical}`);
+      // Build ports string if running
+      let portsStr = '';
+      if (isRunning) {
+        const portStrs = APPS.map(app => {
+          const port = getPortForApp(app, project);
+          return `${app.name.substring(0, 3)}:${port}`;
+        });
+        portsStr = portStrs.join('  ');
+      } else {
+        portsStr = 'Stopped';
+      }
+
+      const headerLeft = `${indicator} ${runningStatus} ${padString(projectName, 8)} ${colors.branch(`(${branch})`)}${dirty} ${config}`;
+      const headerRight = portsStr;
+      const headerPadding = width - stripAnsi(headerLeft).length - stripAnsi(headerRight).length - 4;
+      let headerLine = `${headerLeft}${' '.repeat(Math.max(1, headerPadding))}${headerRight}`;
+
+      if (isSelected) {
+        const rawHeader = `${indicator} ${isRunning ? '●' : '○'} ${padString(projectName, 8)} (${branch})${project.git.isDirty ? '*' : ''} ${isRunning ? `[${projectState.dopplerConfig}]` : ''}`;
+        headerLine = colors.selected(padString(stripAnsi(headerLine), width - 4));
+      }
+
+      lines.push(`${BOX.vertical} ${padString(headerLine, width - 4)} ${BOX.vertical}`);
+
+      // Stats line if running
+      if (isRunning) {
+        let statsStr = '';
+        let totalCpu = 0;
+        let totalMem = 0;
+        let statCount = 0;
+
+        for (const app of APPS) {
+          const stats = processManager.getStats(project.alias, app.name);
+          if (stats) {
+            totalCpu += stats.cpu;
+            totalMem += stats.memory;
+            statCount++;
+          }
+        }
+
+        if (statCount > 0) {
+          const cpu = totalCpu.toFixed(1).padStart(5);
+          const mem = totalMem.toFixed(0).padStart(4);
+          statsStr = colors.dim(`   CPU: ${cpu}% MEM: ${mem}MB`);
+        }
+
+        const uptime = this.formatUptime(projectState.startedAt);
+        const statsLeft = statsStr || '   ';
+        const statsRight = colors.dim(`Running ${uptime}`);
+        const statsPadding = width - stripAnsi(statsLeft).length - stripAnsi(statsRight).length - 4;
+        const statsLine = `${statsLeft}${' '.repeat(Math.max(1, statsPadding))}${statsRight}`;
+        lines.push(`${BOX.vertical} ${padString(statsLine, width - 4)} ${BOX.vertical}`);
+      }
+
+      // Separator between projects (except last)
+      if (i < this.state.projects.length - 1) {
+        lines.push(drawHorizontalLine(width));
+      }
     }
 
-    // Config and uptime row
+    // Config row
     lines.push(`${BOX.vertical}${' '.repeat(width - 2)}${BOX.vertical}`);
-    const configText = `CONFIG: ${colors.highlight(this.state.appState.dopplerConfig)}`;
-    const uptimeText = this.state.appState.startedAt
-      ? `UPTIME: ${colors.info(this.formatUptime(this.state.appState.startedAt))}`
-      : '';
+    const runningCount = Object.keys(this.state.appState.activeProjects).length;
+    const configText = `DEFAULT CONFIG: ${colors.highlight(this.state.appState.dopplerConfig)}`;
+    const runningText = `${runningCount}/${this.state.projects.length} projects running`;
+    const configPadding = width - stripAnsi(configText).length - stripAnsi(runningText).length - 4;
     lines.push(
-      `${BOX.vertical} ${padString(configText, leftWidth)}${padString(uptimeText, rightWidth)} ${BOX.vertical}`
+      `${BOX.vertical} ${configText}${' '.repeat(Math.max(1, configPadding))}${runningText} ${BOX.vertical}`
     );
 
     // Fill remaining space
     const contentRows = lines.length;
     const footerRows = 3;
     const remainingRows = this.state.terminalHeight - contentRows - footerRows;
-    for (let i = 0; i < remainingRows; i++) {
+    for (let i = 0; i < Math.max(0, remainingRows); i++) {
       lines.push(`${BOX.vertical}${' '.repeat(width - 2)}${BOX.vertical}`);
     }
 
     // Help bar
     lines.push(drawHorizontalLine(width));
     const helpText = [
-      `${colors.key('[Enter]')} Switch`,
+      `${colors.key('[1-3]')} Select`,
+      `${colors.key('[Enter]')} Toggle`,
+      `${colors.key('[A]')} Start All`,
+      `${colors.key('[S]')} Stop All`,
       `${colors.key('[c]')} Config`,
       `${colors.key('[r]')} Restart`,
-      `${colors.key('[s]')} Stop`,
       `${colors.key('[l]')} Logs`,
       `${colors.key('[q]')} Quit`,
     ].join('  ');
@@ -637,89 +734,24 @@ export class TUIApp {
     return lines;
   }
 
-  private renderProjectRow(index: number, width: number): string {
-    if (index >= this.state.projects.length) {
-      return padString('', width);
-    }
-
-    const project = this.state.projects[index];
-    const isSelected = index === this.state.selectedProjectIndex;
-    const isActive = project.alias === this.state.appState.activeProject;
-
-    const indicator = isSelected ? '›' : ' ';
-    const activeMarker = isActive ? STATUS.running : ' ';
-    const name = padString(project.alias, 10);
-    const branch = truncateString(colors.branch(project.git.branch), width - 16);
-    const dirty = project.git.isDirty ? colors.warning('*') : ' ';
-
-    let row = `${indicator} ${name} ${branch}${dirty} ${activeMarker}`;
-    if (isSelected) {
-      row = colors.selected(padString(stripAnsi(row), width));
-    } else {
-      row = padString(row, width);
-    }
-
-    return row;
-  }
-
-  private renderStatusRow(index: number, width: number): string {
-    if (index >= APPS.length) {
-      return padString('', width);
-    }
-
-    const app = APPS[index];
-    const processInfo = this.state.appState.processes[app.name];
-    const stats = processManager.getStats(app.name);
-
-    let status = STATUS.stopped;
-    let statusText = 'Stopped';
-    let port = '';
-    let statsText = '';
-
-    if (processInfo) {
-      switch (processInfo.status) {
-        case 'running':
-          status = STATUS.running;
-          statusText = 'Running';
-          port = colors.dim(`:${processInfo.port}`);
-          if (stats) {
-            const cpu = stats.cpu.toFixed(1).padStart(5);
-            const mem = stats.memory.toFixed(0).padStart(4);
-            statsText = colors.dim(` ${cpu}% ${mem}MB`);
-          }
-          break;
-        case 'starting':
-          status = STATUS.starting;
-          statusText = 'Starting';
-          break;
-        case 'error':
-          status = STATUS.error;
-          statusText = 'Error';
-          break;
-        default:
-          status = STATUS.stopped;
-          statusText = 'Stopped';
-      }
-    }
-
-    const name = padString(app.name, 12);
-    const row = `${name} ${status} ${padString(statusText, 8)} ${port}${statsText}`;
-    return padString(row, width);
-  }
-
   private renderLogViewer(): string[] {
     const width = this.state.terminalWidth;
     const height = this.state.terminalHeight;
     const lines: string[] = [];
 
+    const currentProject = this.state.projects[this.state.selectedLogProject];
     const app = APPS[this.state.selectedLogApp];
-    const buffer = processManager.getLogBuffer(app.name);
+    const buffer = currentProject
+      ? processManager.getLogBuffer(currentProject.alias, app.name)
+      : { lines: [], searchMatches: [] };
 
     // Title bar
     lines.push(drawBoxTop(width));
-    const projectName = this.state.appState.activeProject || 'none';
-    const configName = this.state.appState.dopplerConfig;
+    const projectName = currentProject?.alias || 'none';
+    const projectState = currentProject ? this.state.appState.activeProjects[currentProject.alias] : null;
+    const configName = projectState?.dopplerConfig || this.state.appState.dopplerConfig;
     const title = colors.title(`  LOGS: ${projectName} › ${app.name}`) + colors.dim(` (${configName})`);
+    const projectIndicator = `[${this.state.selectedLogProject + 1}/${this.state.projects.length}]`;
     const appIndicator = `[${this.state.selectedLogApp + 1}/${APPS.length}]`;
     const followIndicator = this.state.logFollowMode ? colors.success('FOLLOW ●') : '';
     const searchIndicator = this.state.searchMode
@@ -728,7 +760,7 @@ export class TUIApp {
         ? `[${this.state.searchMatchIndex + 1}/${this.state.searchMatches.length}]`
         : '';
 
-    const headerRight = `${searchIndicator}  ${followIndicator}  ${appIndicator}`;
+    const headerRight = `${searchIndicator}  ${followIndicator}  ${projectIndicator} ${appIndicator}`;
     const headerPadding = width - stripAnsi(title).length - stripAnsi(headerRight).length - 4;
     lines.push(
       `${BOX.vertical} ${title}${' '.repeat(Math.max(0, headerPadding))}${headerRight} ${BOX.vertical}`
@@ -766,6 +798,7 @@ export class TUIApp {
     const helpText = this.state.searchMode
       ? `${colors.key('[Enter]')} Confirm  ${colors.key('[Esc]')} Cancel`
       : [
+          `${colors.key('[[/]]')} Project`,
           `${colors.key('[←/→]')} App`,
           `${colors.key('[↑/↓]')} Scroll`,
           `${colors.key('[/]')} Search`,

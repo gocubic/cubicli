@@ -8,18 +8,25 @@ export interface ProcessInfo {
   status: 'starting' | 'running' | 'stopped' | 'error';
 }
 
-export interface AppState {
-  activeProject: string | null;
+export interface ProjectState {
   dopplerConfig: DopplerConfig;
-  startedAt: string | null;
+  startedAt: string;
   processes: Record<string, ProcessInfo>;
 }
 
+export interface AppState {
+  // Legacy field for backwards compatibility - will be migrated
+  activeProject?: string | null;
+  dopplerConfig: DopplerConfig;
+  startedAt?: string | null;
+  processes?: Record<string, ProcessInfo>;
+  // New multi-project state
+  activeProjects: Record<string, ProjectState>;
+}
+
 const DEFAULT_STATE: AppState = {
-  activeProject: null,
   dopplerConfig: 'dev',
-  startedAt: null,
-  processes: {},
+  activeProjects: {},
 };
 
 export async function ensureStateDir(): Promise<void> {
@@ -34,7 +41,28 @@ export async function loadState(): Promise<AppState> {
   try {
     if (existsSync(STATE_FILE)) {
       const content = await readFile(STATE_FILE, 'utf-8');
-      return { ...DEFAULT_STATE, ...JSON.parse(content) };
+      const parsed = JSON.parse(content);
+
+      // Migrate legacy state format
+      if (parsed.activeProject && !parsed.activeProjects) {
+        const migrated: AppState = {
+          dopplerConfig: parsed.dopplerConfig || 'dev',
+          activeProjects: {},
+        };
+
+        // Migrate the single active project to new format
+        if (parsed.activeProject && parsed.startedAt && parsed.processes) {
+          migrated.activeProjects[parsed.activeProject] = {
+            dopplerConfig: parsed.dopplerConfig || 'dev',
+            startedAt: parsed.startedAt,
+            processes: parsed.processes,
+          };
+        }
+
+        return migrated;
+      }
+
+      return { ...DEFAULT_STATE, ...parsed };
     }
   } catch {
     // Ignore errors, return default state
@@ -102,21 +130,28 @@ export async function verifyRunningProcesses(): Promise<AppState> {
   const state = await loadState();
 
   let changed = false;
-  for (const [appName, info] of Object.entries(state.processes)) {
-    // Check any non-stopped process - if PID is dead, mark as stopped
-    if (info.status !== 'stopped' && !isProcessRunning(info.pid)) {
-      state.processes[appName] = { ...info, status: 'stopped' };
+  const projectsToRemove: string[] = [];
+
+  for (const [projectAlias, projectState] of Object.entries(state.activeProjects)) {
+    for (const [appName, info] of Object.entries(projectState.processes)) {
+      // Check any non-stopped process - if PID is dead, mark as stopped
+      if (info.status !== 'stopped' && !isProcessRunning(info.pid)) {
+        projectState.processes[appName] = { ...info, status: 'stopped' };
+        changed = true;
+      }
+    }
+
+    // If all processes stopped for this project, mark for removal
+    const allStopped = Object.values(projectState.processes).every(p => p.status === 'stopped');
+    if (allStopped) {
+      projectsToRemove.push(projectAlias);
       changed = true;
     }
   }
 
-  // If all processes stopped, clear active project
-  const allStopped = Object.values(state.processes).every(p => p.status === 'stopped');
-  if (allStopped && state.activeProject) {
-    state.activeProject = null;
-    state.startedAt = null;
-    state.processes = {};
-    changed = true;
+  // Remove projects with all stopped processes
+  for (const alias of projectsToRemove) {
+    delete state.activeProjects[alias];
   }
 
   if (changed) {

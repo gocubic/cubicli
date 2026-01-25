@@ -1,8 +1,8 @@
 import treeKill from 'tree-kill';
 import { appendFile, readFile, writeFile, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
-import { APPS, LOG_DIR, type AppConfig, type DopplerConfig, type Project } from '../config/projects';
-import { loadState, saveState, isProcessRunning, getProcessStats, ensurePortsAvailable, resetNxDaemon, type AppState, type ProcessInfo, type ProcessStats } from './state';
+import { APPS, LOG_DIR, PROJECTS, URL_ENV_VARS, getPortForApp, getProjectPorts, type AppConfig, type DopplerConfig, type Project } from '../config/projects';
+import { loadState, saveState, isProcessRunning, getProcessStats, ensurePortsAvailable, resetNxDaemon, type AppState, type ProcessInfo, type ProcessStats, type ProjectState } from './state';
 
 const MAX_LOG_LINES = 10000;
 
@@ -11,19 +11,24 @@ export interface LogBuffer {
   searchMatches: number[];
 }
 
+// Key format: "projectAlias:appName"
+function makeLogKey(projectAlias: string, appName: string): string {
+  return `${projectAlias}:${appName}`;
+}
+
 export class ProcessManager {
-  private processes: Map<string, Bun.Subprocess> = new Map();
-  private adoptedPids: Map<string, number> = new Map(); // PIDs of processes we didn't spawn
+  // Nested map: projectAlias -> appName -> subprocess
+  private processes: Map<string, Map<string, Bun.Subprocess>> = new Map();
+  // Adopted PIDs: projectAlias -> appName -> pid
+  private adoptedPids: Map<string, Map<string, number>> = new Map();
+  // Log buffers keyed by "projectAlias:appName"
   private logBuffers: Map<string, LogBuffer> = new Map();
+  // Process stats keyed by "projectAlias:appName"
   private processStats: Map<string, ProcessStats> = new Map();
-  private onLogUpdate?: (appName: string, line: string, didShift: boolean) => void;
+  private onLogUpdate?: (projectAlias: string, appName: string, line: string, didShift: boolean) => void;
   private truncateCounter = 0;
 
   constructor() {
-    // Initialize log buffers for each app
-    for (const app of APPS) {
-      this.logBuffers.set(app.name, { lines: [], searchMatches: [] });
-    }
     // Ensure log directory exists
     this.ensureLogDir();
   }
@@ -34,22 +39,22 @@ export class ProcessManager {
     }
   }
 
-  private getLogFilePath(appName: string): string {
-    return `${LOG_DIR}/${appName}.log`;
+  private getLogFilePath(projectAlias: string, appName: string): string {
+    return `${LOG_DIR}/${projectAlias}-${appName}.log`;
   }
 
-  private async appendToLogFile(appName: string, line: string): Promise<void> {
+  private async appendToLogFile(projectAlias: string, appName: string, line: string): Promise<void> {
     try {
       await this.ensureLogDir();
-      await appendFile(this.getLogFilePath(appName), line + '\n');
+      await appendFile(this.getLogFilePath(projectAlias, appName), line + '\n');
     } catch {
       // Ignore write errors
     }
   }
 
-  private async loadLogsFromFile(appName: string): Promise<void> {
+  private async loadLogsFromFile(projectAlias: string, appName: string): Promise<void> {
     try {
-      const filePath = this.getLogFilePath(appName);
+      const filePath = this.getLogFilePath(projectAlias, appName);
       if (!existsSync(filePath)) return;
 
       const content = await readFile(filePath, 'utf-8');
@@ -58,18 +63,16 @@ export class ProcessManager {
       // Take only the last MAX_LOG_LINES
       const recentLines = lines.slice(-MAX_LOG_LINES);
 
-      const buffer = this.logBuffers.get(appName);
-      if (buffer) {
-        buffer.lines = recentLines;
-      }
+      const key = makeLogKey(projectAlias, appName);
+      this.logBuffers.set(key, { lines: recentLines, searchMatches: [] });
     } catch {
       // Ignore read errors
     }
   }
 
-  private async truncateLogFile(appName: string): Promise<void> {
+  private async truncateLogFile(projectAlias: string, appName: string): Promise<void> {
     try {
-      const filePath = this.getLogFilePath(appName);
+      const filePath = this.getLogFilePath(projectAlias, appName);
       if (!existsSync(filePath)) return;
 
       const content = await readFile(filePath, 'utf-8');
@@ -86,11 +89,14 @@ export class ProcessManager {
 
   async updateStats(): Promise<void> {
     const state = await loadState();
-    for (const [appName, info] of Object.entries(state.processes)) {
-      if (info.status === 'running') {
-        const stats = await getProcessStats(info.pid);
-        if (stats) {
-          this.processStats.set(appName, stats);
+    for (const [projectAlias, projectState] of Object.entries(state.activeProjects)) {
+      for (const [appName, info] of Object.entries(projectState.processes)) {
+        if (info.status === 'running') {
+          const stats = await getProcessStats(info.pid);
+          if (stats) {
+            const key = makeLogKey(projectAlias, appName);
+            this.processStats.set(key, stats);
+          }
         }
       }
     }
@@ -99,45 +105,59 @@ export class ProcessManager {
     this.truncateCounter++;
     if (this.truncateCounter >= 60) {
       this.truncateCounter = 0;
-      for (const app of APPS) {
-        await this.truncateLogFile(app.name);
+      for (const project of PROJECTS) {
+        for (const app of APPS) {
+          await this.truncateLogFile(project.alias, app.name);
+        }
       }
     }
   }
 
-  getStats(appName: string): ProcessStats | undefined {
-    return this.processStats.get(appName);
+  getStats(projectAlias: string, appName: string): ProcessStats | undefined {
+    const key = makeLogKey(projectAlias, appName);
+    return this.processStats.get(key);
   }
 
   async adoptRunningProcesses(): Promise<void> {
     const state = await loadState();
-    for (const [appName, info] of Object.entries(state.processes)) {
-      if (info.status === 'running' && isProcessRunning(info.pid)) {
-        // Track this PID as adopted (we can kill it but can't read its output)
-        this.adoptedPids.set(appName, info.pid);
-        // Load recent logs from file
-        await this.loadLogsFromFile(appName);
+    for (const [projectAlias, projectState] of Object.entries(state.activeProjects)) {
+      for (const [appName, info] of Object.entries(projectState.processes)) {
+        if (info.status === 'running' && isProcessRunning(info.pid)) {
+          // Track this PID as adopted (we can kill it but can't read its output)
+          if (!this.adoptedPids.has(projectAlias)) {
+            this.adoptedPids.set(projectAlias, new Map());
+          }
+          this.adoptedPids.get(projectAlias)!.set(appName, info.pid);
+          // Load recent logs from file
+          await this.loadLogsFromFile(projectAlias, appName);
+        }
       }
     }
   }
 
-  setLogUpdateHandler(handler: (appName: string, line: string, didShift: boolean) => void): void {
+  setLogUpdateHandler(handler: (projectAlias: string, appName: string, line: string, didShift: boolean) => void): void {
     this.onLogUpdate = handler;
   }
 
-  getLogBuffer(appName: string): LogBuffer {
-    return this.logBuffers.get(appName) || { lines: [], searchMatches: [] };
+  getLogBuffer(projectAlias: string, appName: string): LogBuffer {
+    const key = makeLogKey(projectAlias, appName);
+    return this.logBuffers.get(key) || { lines: [], searchMatches: [] };
   }
 
-  clearLogBuffer(appName: string): void {
-    this.logBuffers.set(appName, { lines: [], searchMatches: [] });
+  clearLogBuffer(projectAlias: string, appName: string): void {
+    const key = makeLogKey(projectAlias, appName);
+    this.logBuffers.set(key, { lines: [], searchMatches: [] });
     // Also clear the log file
-    writeFile(this.getLogFilePath(appName), '').catch(() => {});
+    writeFile(this.getLogFilePath(projectAlias, appName), '').catch(() => {});
   }
 
-  private addLogLine(appName: string, line: string): boolean {
-    const buffer = this.logBuffers.get(appName);
-    if (!buffer) return false;
+  private addLogLine(projectAlias: string, appName: string, line: string): boolean {
+    const key = makeLogKey(projectAlias, appName);
+    let buffer = this.logBuffers.get(key);
+    if (!buffer) {
+      buffer = { lines: [], searchMatches: [] };
+      this.logBuffers.set(key, buffer);
+    }
 
     buffer.lines.push(line);
 
@@ -149,46 +169,106 @@ export class ProcessManager {
     }
 
     // Persist to file (fire and forget)
-    this.appendToLogFile(appName, line);
+    this.appendToLogFile(projectAlias, appName, line);
 
-    this.onLogUpdate?.(appName, line, didShift);
+    this.onLogUpdate?.(projectAlias, appName, line, didShift);
 
     return didShift;
   }
 
-  async startAll(project: Project, dopplerConfig: DopplerConfig): Promise<void> {
-    // Ensure all required ports are available before starting
-    const requiredPorts = APPS.map((app) => app.port);
+  /**
+   * Start a single project (all its apps)
+   */
+  async startProject(project: Project, dopplerConfig: DopplerConfig): Promise<void> {
+    // Ensure all required ports for this project are available
+    const requiredPorts = getProjectPorts(project);
     await ensurePortsAvailable(requiredPorts);
 
     // Reset nx daemon to clear any stale state from previous runs
     await resetNxDaemon(project.path);
 
-    // Clear log buffers
+    // Clear log buffers for this project
     for (const app of APPS) {
-      this.clearLogBuffer(app.name);
+      this.clearLogBuffer(project.alias, app.name);
     }
 
     const state = await loadState();
-    state.activeProject = project.alias;
-    state.dopplerConfig = dopplerConfig;
-    state.startedAt = new Date().toISOString();
-    state.processes = {};
+    const projectState: ProjectState = {
+      dopplerConfig,
+      startedAt: new Date().toISOString(),
+      processes: {},
+    };
 
-    for (const app of APPS) {
-      await this.startApp(app, project, dopplerConfig, state);
+    // Initialize process map for this project
+    if (!this.processes.has(project.alias)) {
+      this.processes.set(project.alias, new Map());
     }
 
+    for (const app of APPS) {
+      await this.startApp(app, project, dopplerConfig, projectState);
+    }
+
+    state.activeProjects[project.alias] = projectState;
     await saveState(state);
+  }
+
+  /**
+   * Start all projects
+   */
+  async startAllProjects(dopplerConfig: DopplerConfig): Promise<void> {
+    for (const project of PROJECTS) {
+      if (!this.isProjectRunning(project.alias)) {
+        await this.startProject(project, dopplerConfig);
+      }
+    }
   }
 
   private async startApp(
     app: AppConfig,
     project: Project,
     dopplerConfig: DopplerConfig,
-    state: AppState
+    projectState: ProjectState
   ): Promise<void> {
-    const cmd = ['doppler', 'run', '--config', dopplerConfig, '--', ...app.command.split(' ')];
+    const port = getPortForApp(app, project);
+
+    // Build MICROSERVICE_*_PORT and MICROSERVICE_*_HOST env var overrides for all apps
+    const envOverrides: string[] = [];
+    for (const appConfig of APPS) {
+      const appPort = getPortForApp(appConfig, project);
+      envOverrides.push(`${appConfig.portEnvVar}=${appPort}`);
+      envOverrides.push(`${appConfig.hostEnvVar}=http://localhost`);
+    }
+
+    // Add URL-based env vars (e.g., NEXT_PUBLIC_API_BASE_URL)
+    for (const [envVar, appName] of Object.entries(URL_ENV_VARS)) {
+      const appConfig = APPS.find(a => a.name === appName);
+      if (appConfig) {
+        const appPort = getPortForApp(appConfig, project);
+        envOverrides.push(`${envVar}=http://localhost:${appPort}`);
+      }
+    }
+
+    // Isolate NX daemon per project to prevent conflicts when running multiple projects
+    const nxDaemonDir = `${LOG_DIR}/nx-daemon-${project.alias}`;
+    envOverrides.push(`NX_DAEMON_SOCKET_DIR=${nxDaemonDir}`);
+    envOverrides.push(`NX_PROJECT_GRAPH_CACHE_DIRECTORY=${nxDaemonDir}`);
+
+    envOverrides.push(`PORT=${port}`);
+
+    // Use env command to override doppler's values
+    const cmdParts = app.command.split(' ');
+
+    // Next.js apps need --port argument
+    if (app.name === 'client-app' || app.name === 'mycelium') {
+      cmdParts.push('--port', port.toString());
+    }
+
+    const cmd = [
+      'doppler', 'run', '--config', dopplerConfig, '--',
+      'env',
+      ...envOverrides,
+      ...cmdParts,
+    ];
 
     const proc = Bun.spawn({
       cmd,
@@ -197,27 +277,31 @@ export class ProcessManager {
       stderr: 'pipe',
       env: {
         ...process.env,
-        FORCE_COLOR: '1', // Preserve colors
+        FORCE_COLOR: '1',
       },
     });
 
-    this.processes.set(app.name, proc);
+    if (!this.processes.has(project.alias)) {
+      this.processes.set(project.alias, new Map());
+    }
+    this.processes.get(project.alias)!.set(app.name, proc);
 
-    state.processes[app.name] = {
+    projectState.processes[app.name] = {
       pid: proc.pid,
-      port: app.port,
+      port,
       status: 'starting',
     };
 
     // Stream stdout
-    this.streamOutput(app.name, proc.stdout);
-    this.streamOutput(app.name, proc.stderr);
+    this.streamOutput(project.alias, app.name, proc.stdout);
+    this.streamOutput(project.alias, app.name, proc.stderr);
 
     // Update status when process is ready (after a brief delay)
     setTimeout(async () => {
       const currentState = await loadState();
-      if (currentState.processes[app.name] && isProcessRunning(proc.pid)) {
-        currentState.processes[app.name].status = 'running';
+      const pState = currentState.activeProjects[project.alias];
+      if (pState?.processes[app.name] && isProcessRunning(proc.pid)) {
+        pState.processes[app.name].status = 'running';
         await saveState(currentState);
       }
     }, 3000);
@@ -225,15 +309,16 @@ export class ProcessManager {
     // Handle process exit
     proc.exited.then(async (code) => {
       const currentState = await loadState();
-      if (currentState.processes[app.name]) {
-        currentState.processes[app.name].status = code === 0 ? 'stopped' : 'error';
+      const pState = currentState.activeProjects[project.alias];
+      if (pState?.processes[app.name]) {
+        pState.processes[app.name].status = code === 0 ? 'stopped' : 'error';
         await saveState(currentState);
       }
-      this.processes.delete(app.name);
+      this.processes.get(project.alias)?.delete(app.name);
     });
   }
 
-  private async streamOutput(appName: string, stream: ReadableStream<Uint8Array>): Promise<void> {
+  private async streamOutput(projectAlias: string, appName: string, stream: ReadableStream<Uint8Array>): Promise<void> {
     const reader = stream.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
@@ -252,7 +337,7 @@ export class ProcessManager {
         for (const line of lines) {
           if (line.trim()) {
             const timestamp = new Date().toLocaleTimeString('en-US', { hour12: false });
-            this.addLogLine(appName, `[${timestamp}] ${line}`);
+            this.addLogLine(projectAlias, appName, `[${timestamp}] ${line}`);
           }
         }
       }
@@ -260,46 +345,68 @@ export class ProcessManager {
       // Process remaining buffer
       if (buffer.trim()) {
         const timestamp = new Date().toLocaleTimeString('en-US', { hour12: false });
-        this.addLogLine(appName, `[${timestamp}] ${buffer}`);
+        this.addLogLine(projectAlias, appName, `[${timestamp}] ${buffer}`);
       }
     } catch {
       // Stream closed
     }
   }
 
-  async stopAll(): Promise<void> {
+  /**
+   * Stop a single project
+   */
+  async stopProject(projectAlias: string): Promise<void> {
     const state = await loadState();
+    const projectState = state.activeProjects[projectAlias];
 
-    // Stop spawned processes
-    const stopPromises = Array.from(this.processes.entries()).map(async ([appName, proc]) => {
-      await this.killProcessTree(proc.pid);
-      if (state.processes[appName]) {
-        state.processes[appName].status = 'stopped';
-      }
-    });
+    // Stop spawned processes for this project
+    const projectProcs = this.processes.get(projectAlias);
+    if (projectProcs) {
+      const stopPromises = Array.from(projectProcs.entries()).map(async ([appName, proc]) => {
+        await this.killProcessTree(proc.pid);
+        if (projectState?.processes[appName]) {
+          projectState.processes[appName].status = 'stopped';
+        }
+      });
+      await Promise.all(stopPromises);
+      projectProcs.clear();
+      this.processes.delete(projectAlias);
+    }
 
-    // Stop adopted processes (ones we didn't spawn but are tracking)
-    const adoptedPromises = Array.from(this.adoptedPids.entries()).map(async ([appName, pid]) => {
-      await this.killProcessTree(pid);
-      if (state.processes[appName]) {
-        state.processes[appName].status = 'stopped';
-      }
-    });
+    // Stop adopted processes for this project
+    const adoptedProcs = this.adoptedPids.get(projectAlias);
+    if (adoptedProcs) {
+      const adoptedPromises = Array.from(adoptedProcs.entries()).map(async ([appName, pid]) => {
+        await this.killProcessTree(pid);
+        if (projectState?.processes[appName]) {
+          projectState.processes[appName].status = 'stopped';
+        }
+      });
+      await Promise.all(adoptedPromises);
+      adoptedProcs.clear();
+      this.adoptedPids.delete(projectAlias);
+    }
 
-    await Promise.all([...stopPromises, ...adoptedPromises]);
-
-    this.processes.clear();
-    this.adoptedPids.clear();
-    state.activeProject = null;
-    state.startedAt = null;
-    state.processes = {};
-
+    // Remove from active projects
+    delete state.activeProjects[projectAlias];
     await saveState(state);
   }
 
-  async restartAll(project: Project, dopplerConfig: DopplerConfig): Promise<void> {
-    await this.stopAll();
-    await this.startAll(project, dopplerConfig);
+  /**
+   * Stop all projects
+   */
+  async stopAllProjects(): Promise<void> {
+    const state = await loadState();
+    const projectAliases = Object.keys(state.activeProjects);
+
+    for (const alias of projectAliases) {
+      await this.stopProject(alias);
+    }
+  }
+
+  async restartProject(project: Project, dopplerConfig: DopplerConfig): Promise<void> {
+    await this.stopProject(project.alias);
+    await this.startProject(project, dopplerConfig);
   }
 
   async restartApp(appName: string, project: Project, dopplerConfig: DopplerConfig): Promise<void> {
@@ -307,24 +414,39 @@ export class ProcessManager {
     if (!app) return;
 
     // Stop the specific app (check both spawned and adopted)
-    const proc = this.processes.get(appName);
-    if (proc) {
-      await this.killProcessTree(proc.pid);
-      this.processes.delete(appName);
-    } else {
-      const adoptedPid = this.adoptedPids.get(appName);
+    const projectProcs = this.processes.get(project.alias);
+    if (projectProcs) {
+      const proc = projectProcs.get(appName);
+      if (proc) {
+        await this.killProcessTree(proc.pid);
+        projectProcs.delete(appName);
+      }
+    }
+
+    const adoptedProcs = this.adoptedPids.get(project.alias);
+    if (adoptedProcs) {
+      const adoptedPid = adoptedProcs.get(appName);
       if (adoptedPid) {
         await this.killProcessTree(adoptedPid);
-        this.adoptedPids.delete(appName);
+        adoptedProcs.delete(appName);
       }
     }
 
     // Clear log buffer
-    this.clearLogBuffer(appName);
+    this.clearLogBuffer(project.alias, appName);
 
     // Start the app again
     const state = await loadState();
-    await this.startApp(app, project, dopplerConfig, state);
+    let projectState = state.activeProjects[project.alias];
+    if (!projectState) {
+      projectState = {
+        dopplerConfig,
+        startedAt: new Date().toISOString(),
+        processes: {},
+      };
+      state.activeProjects[project.alias] = projectState;
+    }
+    await this.startApp(app, project, dopplerConfig, projectState);
     await saveState(state);
   }
 
@@ -356,11 +478,45 @@ export class ProcessManager {
     });
   }
 
+  /**
+   * Check if any project is running
+   */
   isRunning(): boolean {
-    return this.processes.size > 0 || this.adoptedPids.size > 0;
+    for (const projectProcs of this.processes.values()) {
+      if (projectProcs.size > 0) return true;
+    }
+    for (const adoptedProcs of this.adoptedPids.values()) {
+      if (adoptedProcs.size > 0) return true;
+    }
+    return false;
   }
 
-  getRunningProcesses(): Map<string, Bun.Subprocess> {
+  /**
+   * Check if a specific project is running
+   */
+  isProjectRunning(projectAlias: string): boolean {
+    const projectProcs = this.processes.get(projectAlias);
+    if (projectProcs && projectProcs.size > 0) return true;
+    const adoptedProcs = this.adoptedPids.get(projectAlias);
+    if (adoptedProcs && adoptedProcs.size > 0) return true;
+    return false;
+  }
+
+  /**
+   * Get list of running project aliases
+   */
+  getRunningProjects(): string[] {
+    const running = new Set<string>();
+    for (const [alias, procs] of this.processes.entries()) {
+      if (procs.size > 0) running.add(alias);
+    }
+    for (const [alias, pids] of this.adoptedPids.entries()) {
+      if (pids.size > 0) running.add(alias);
+    }
+    return Array.from(running);
+  }
+
+  getRunningProcesses(): Map<string, Map<string, Bun.Subprocess>> {
     return this.processes;
   }
 }

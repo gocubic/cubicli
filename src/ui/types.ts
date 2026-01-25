@@ -12,6 +12,7 @@ export interface AppUIState {
   viewMode: ViewMode;
   selectedProjectIndex: number;
   selectedLogApp: number;
+  selectedLogProject: number; // Index of project to view logs for
   logScrollOffset: number;
   logFollowMode: boolean;
   searchMode: boolean;
