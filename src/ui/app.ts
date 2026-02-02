@@ -26,11 +26,20 @@ import {
 } from './renderer';
 import type { AppUIState, ProjectWithGit, ViewMode } from './types';
 
+// Scroll physics constants
+const SCROLL_BASE_LINES = 3;
+const SCROLL_VELOCITY_DECAY = 0.92;
+const SCROLL_VELOCITY_THRESHOLD = 0.1;
+const SCROLL_RAPID_THRESHOLD_MS = 50;
+const MOMENTUM_FRAME_INTERVAL_MS = 16;
+const MAX_SCROLL_VELOCITY = 30;
+
 export class TUIApp {
   private state: AppUIState;
   private running = false;
   private renderInterval?: Timer;
   private mouseTrackingEnabled = false;
+  private momentumInterval?: Timer;
 
   constructor() {
     const { rows, cols } = getTerminalSize();
@@ -41,6 +50,10 @@ export class TUIApp {
       selectedLogProject: 0,
       logScrollOffset: 0,
       logFollowMode: true,
+      scrollVelocity: 0,
+      scrollAccumulator: 0,
+      lastScrollTime: 0,
+      momentumActive: false,
       searchMode: false,
       searchQuery: '',
       searchMatches: [],
@@ -132,6 +145,9 @@ export class TUIApp {
     if (this.renderInterval) {
       clearInterval(this.renderInterval);
     }
+    if (this.momentumInterval) {
+      clearInterval(this.momentumInterval);
+    }
 
     // Kill all running processes before exiting
     if (processManager.isRunning()) {
@@ -174,7 +190,8 @@ export class TUIApp {
   }
 
   private updateMouseTracking(): void {
-    const shouldEnable = this.state.viewMode === 'logs' && this.state.logFollowMode;
+    // Always enable mouse tracking in logs view for scroll wheel support
+    const shouldEnable = this.state.viewMode === 'logs';
     if (shouldEnable && !this.mouseTrackingEnabled) {
       enableMouseTracking();
       this.mouseTrackingEnabled = true;
@@ -184,13 +201,134 @@ export class TUIApp {
     }
   }
 
+  /**
+   * Parse SGR mouse event format: \x1b[<button;x;yM or \x1b[<button;x;ym
+   */
+  private parseMouseEvent(data: string): { button: number; x: number; y: number } | null {
+    const match = data.match(/^\x1b\[<(\d+);(\d+);(\d+)[Mm]$/);
+    if (!match) return null;
+    return {
+      button: parseInt(match[1], 10),
+      x: parseInt(match[2], 10),
+      y: parseInt(match[3], 10),
+    };
+  }
+
+  /**
+   * Handle scroll wheel events with velocity-based acceleration
+   */
+  private handleScrollWheel(direction: 'up' | 'down'): void {
+    const now = Date.now();
+    const timeDelta = now - this.state.lastScrollTime;
+    const directionSign = direction === 'up' ? -1 : 1;
+
+    // Calculate velocity based on timing between events
+    if (timeDelta < SCROLL_RAPID_THRESHOLD_MS && this.state.scrollVelocity * directionSign > 0) {
+      // Rapid scrolling in same direction - increase velocity
+      this.state.scrollVelocity += directionSign * SCROLL_BASE_LINES * 0.5;
+      this.state.scrollVelocity = Math.max(-MAX_SCROLL_VELOCITY, Math.min(MAX_SCROLL_VELOCITY, this.state.scrollVelocity));
+    } else {
+      // New scroll or direction change - reset velocity
+      this.state.scrollVelocity = directionSign * SCROLL_BASE_LINES;
+    }
+
+    this.state.lastScrollTime = now;
+
+    // Apply immediate scroll
+    this.applyScroll(this.state.scrollVelocity);
+
+    // Start momentum if not already running
+    this.startMomentumScroll();
+  }
+
+  /**
+   * Apply scroll with sub-line precision using accumulator
+   */
+  private applyScroll(amount: number): void {
+    const currentProject = this.state.projects[this.state.selectedLogProject];
+    if (!currentProject) return;
+
+    const buffer = processManager.getLogBuffer(currentProject.alias, APPS[this.state.selectedLogApp].name);
+    const viewHeight = this.getLogViewHeight();
+    const maxOffset = Math.max(0, buffer.lines.length - viewHeight);
+
+    // Add to accumulator for sub-line precision
+    this.state.scrollAccumulator += amount;
+
+    // Extract whole lines from accumulator
+    const linesToScroll = Math.trunc(this.state.scrollAccumulator);
+    this.state.scrollAccumulator -= linesToScroll;
+
+    if (linesToScroll !== 0) {
+      const newOffset = this.state.logScrollOffset + linesToScroll;
+      this.state.logScrollOffset = Math.max(0, Math.min(maxOffset, newOffset));
+
+      // Handle follow mode
+      if (linesToScroll < 0) {
+        // Scrolling up - disable follow mode
+        this.state.logFollowMode = false;
+      } else if (this.state.logScrollOffset >= maxOffset) {
+        // Reached bottom - enable follow mode
+        this.state.logFollowMode = true;
+      }
+
+      this.updateMouseTracking();
+      this.render();
+    }
+  }
+
+  /**
+   * Start momentum scroll animation loop
+   */
+  private startMomentumScroll(): void {
+    if (this.state.momentumActive) return;
+
+    this.state.momentumActive = true;
+    this.momentumInterval = setInterval(() => {
+      // Apply decay
+      this.state.scrollVelocity *= SCROLL_VELOCITY_DECAY;
+
+      // Check if we should stop
+      if (Math.abs(this.state.scrollVelocity) < SCROLL_VELOCITY_THRESHOLD) {
+        this.stopMomentumScroll();
+        return;
+      }
+
+      // Apply scroll
+      this.applyScroll(this.state.scrollVelocity);
+    }, MOMENTUM_FRAME_INTERVAL_MS);
+  }
+
+  /**
+   * Stop momentum scroll animation
+   */
+  private stopMomentumScroll(): void {
+    if (this.momentumInterval) {
+      clearInterval(this.momentumInterval);
+      this.momentumInterval = undefined;
+    }
+    this.state.momentumActive = false;
+    this.state.scrollVelocity = 0;
+    this.state.scrollAccumulator = 0;
+  }
+
   private async handleKeypress(key: string): Promise<void> {
     // Handle mouse events (SGR mode: \x1b[<button;x;yM or m)
-    // When mouse is clicked in log view, disable follow mode to allow text selection
     if (key.startsWith('\x1b[<') && this.state.viewMode === 'logs') {
-      this.state.logFollowMode = false;
-      this.updateMouseTracking();
-      this.render(); // Update the follow indicator
+      const mouseEvent = this.parseMouseEvent(key);
+      if (mouseEvent) {
+        // Scroll wheel events
+        if (mouseEvent.button === 64) {
+          // Scroll up
+          this.handleScrollWheel('up');
+          return;
+        } else if (mouseEvent.button === 65) {
+          // Scroll down
+          this.handleScrollWheel('down');
+          return;
+        }
+      }
+      // Ignore other mouse events (clicks) - mouse tracking stays on for scroll
       return;
     }
 
@@ -308,17 +446,20 @@ export class TUIApp {
 
     switch (key) {
       case '\x1b': // Escape
+        this.stopMomentumScroll();
         this.state.viewMode = 'dashboard';
         break;
 
       case '\x1b[A': // Up arrow
       case 'k':
+        this.stopMomentumScroll();
         this.state.logFollowMode = false;
         this.state.logScrollOffset = Math.max(0, this.state.logScrollOffset - 1);
         break;
 
       case '\x1b[B': // Down arrow
       case 'j':
+        this.stopMomentumScroll();
         this.state.logScrollOffset = Math.min(
           Math.max(0, buffer.lines.length - viewHeight),
           this.state.logScrollOffset + 1
@@ -329,11 +470,13 @@ export class TUIApp {
         break;
 
       case '\x1b[5~': // Page Up
+        this.stopMomentumScroll();
         this.state.logFollowMode = false;
         this.state.logScrollOffset = Math.max(0, this.state.logScrollOffset - viewHeight);
         break;
 
       case '\x1b[6~': // Page Down
+        this.stopMomentumScroll();
         this.state.logScrollOffset = Math.min(
           Math.max(0, buffer.lines.length - viewHeight),
           this.state.logScrollOffset + viewHeight
@@ -630,20 +773,48 @@ export class TUIApp {
       const projectState = this.state.appState.activeProjects[project.alias];
       const isRunning = !!projectState;
 
+      // Get per-app listening status (port actually responding)
+      const { listening: listeningApps, total: totalApps } = processManager.getListeningAppCount(project.alias);
+      const { running: runningApps } = processManager.getRunningAppCount(project.alias);
+
       // Project header line
       const indicator = isSelected ? colors.selected('›') : ' ';
-      const runningStatus = isRunning ? STATUS.running : STATUS.stopped;
+
+      // Determine status indicator color:
+      // - Red: no processes running
+      // - Yellow: processes running but not all ports listening (starting/partial)
+      // - Green: all ports listening
+      let runningStatus: string;
+      if (runningApps === 0) {
+        runningStatus = STATUS.stopped; // Red - all down
+      } else if (listeningApps === totalApps) {
+        runningStatus = STATUS.running; // Green - all up and listening
+      } else {
+        runningStatus = colors.warning('●'); // Orange - starting or partial
+      }
+
       const projectName = project.alias.toUpperCase();
       const branch = truncateString(project.git.branch, 20);
       const dirty = project.git.isDirty ? colors.warning('*') : '';
       const config = isRunning ? colors.dim(`[${projectState.dopplerConfig}]`) : '';
 
-      // Build ports string if running
+      // Build service status dots and ports string
       let portsStr = '';
       if (isRunning) {
         const portStrs = APPS.map(app => {
           const port = getPortForApp(app, project);
-          return `${app.name.substring(0, 3)}:${port}`;
+          const isListening = processManager.isAppListening(project.alias, app.name);
+          const isProcessRunning = processManager.isAppRunning(project.alias, app.name);
+          // Green = listening, Yellow = starting (process running but not listening), Red = down
+          let dot: string;
+          if (isListening) {
+            dot = colors.success('●');
+          } else if (isProcessRunning) {
+            dot = colors.warning('●'); // Starting
+          } else {
+            dot = colors.error('●');
+          }
+          return `${dot} ${app.name.substring(0, 3)}:${port}`;
         });
         portsStr = portStrs.join('  ');
       } else {
@@ -656,7 +827,7 @@ export class TUIApp {
       let headerLine = `${headerLeft}${' '.repeat(Math.max(1, headerPadding))}${headerRight}`;
 
       if (isSelected) {
-        const rawHeader = `${indicator} ${isRunning ? '●' : '○'} ${padString(projectName, 8)} (${branch})${project.git.isDirty ? '*' : ''} ${isRunning ? `[${projectState.dopplerConfig}]` : ''}`;
+        const rawHeader = `${indicator} ${listeningApps === 0 ? '○' : listeningApps === totalApps ? '●' : '◐'} ${padString(projectName, 8)} (${branch})${project.git.isDirty ? '*' : ''} ${isRunning ? `[${projectState.dopplerConfig}]` : ''}`;
         headerLine = colors.selected(padString(stripAnsi(headerLine), width - 4));
       }
 

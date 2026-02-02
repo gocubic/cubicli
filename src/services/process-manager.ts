@@ -2,7 +2,7 @@ import treeKill from 'tree-kill';
 import { appendFile, readFile, writeFile, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
 import { APPS, LOG_DIR, PROJECTS, URL_ENV_VARS, getPortForApp, getProjectPorts, type AppConfig, type DopplerConfig, type Project } from '../config/projects';
-import { loadState, saveState, isProcessRunning, getProcessStats, ensurePortsAvailable, resetNxDaemon, type AppState, type ProcessInfo, type ProcessStats, type ProjectState } from './state';
+import { loadState, saveState, isProcessRunning, getProcessStats, ensurePortsAvailable, resetNxDaemon, isPortInUse, type AppState, type ProcessInfo, type ProcessStats, type ProjectState } from './state';
 
 const MAX_LOG_LINES = 10000;
 
@@ -25,6 +25,8 @@ export class ProcessManager {
   private logBuffers: Map<string, LogBuffer> = new Map();
   // Process stats keyed by "projectAlias:appName"
   private processStats: Map<string, ProcessStats> = new Map();
+  // Port listening status keyed by "projectAlias:appName"
+  private portListening: Map<string, boolean> = new Map();
   private onLogUpdate?: (projectAlias: string, appName: string, line: string, didShift: boolean) => void;
   private truncateCounter = 0;
 
@@ -91,12 +93,17 @@ export class ProcessManager {
     const state = await loadState();
     for (const [projectAlias, projectState] of Object.entries(state.activeProjects)) {
       for (const [appName, info] of Object.entries(projectState.processes)) {
-        if (info.status === 'running') {
+        const key = makeLogKey(projectAlias, appName);
+        if (info.status === 'running' || info.status === 'starting') {
           const stats = await getProcessStats(info.pid);
           if (stats) {
-            const key = makeLogKey(projectAlias, appName);
             this.processStats.set(key, stats);
           }
+          // Check if port is actually listening
+          const listening = await isPortInUse(info.port);
+          this.portListening.set(key, listening);
+        } else {
+          this.portListening.set(key, false);
         }
       }
     }
@@ -500,6 +507,53 @@ export class ProcessManager {
     const adoptedProcs = this.adoptedPids.get(projectAlias);
     if (adoptedProcs && adoptedProcs.size > 0) return true;
     return false;
+  }
+
+  /**
+   * Check if a specific app is running for a project
+   */
+  isAppRunning(projectAlias: string, appName: string): boolean {
+    const projectProcs = this.processes.get(projectAlias);
+    if (projectProcs?.has(appName)) return true;
+    const adoptedProcs = this.adoptedPids.get(projectAlias);
+    if (adoptedProcs?.has(appName)) return true;
+    return false;
+  }
+
+  /**
+   * Check if a specific app's port is actually listening
+   */
+  isAppListening(projectAlias: string, appName: string): boolean {
+    const key = makeLogKey(projectAlias, appName);
+    return this.portListening.get(key) ?? false;
+  }
+
+  /**
+   * Get count of listening apps for a project (ports actually responding)
+   */
+  getListeningAppCount(projectAlias: string): { listening: number; total: number } {
+    let listening = 0;
+    const total = APPS.length;
+    for (const app of APPS) {
+      if (this.isAppListening(projectAlias, app.name)) {
+        listening++;
+      }
+    }
+    return { listening, total };
+  }
+
+  /**
+   * Get count of running apps for a project (process spawned)
+   */
+  getRunningAppCount(projectAlias: string): { running: number; total: number } {
+    let running = 0;
+    const total = APPS.length;
+    for (const app of APPS) {
+      if (this.isAppRunning(projectAlias, app.name)) {
+        running++;
+      }
+    }
+    return { running, total };
   }
 
   /**

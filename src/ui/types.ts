@@ -15,6 +15,11 @@ export interface AppUIState {
   selectedLogProject: number; // Index of project to view logs for
   logScrollOffset: number;
   logFollowMode: boolean;
+  // Velocity-based scrolling state
+  scrollVelocity: number;      // Current velocity (lines per tick)
+  scrollAccumulator: number;   // Sub-line precision accumulator
+  lastScrollTime: number;      // Timestamp for velocity calculation
+  momentumActive: boolean;     // Whether momentum animation is running
   searchMode: boolean;
   searchQuery: string;
   searchMatches: number[];
