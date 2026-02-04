@@ -29,6 +29,9 @@ export interface AppUIState {
   appState: AppState;
   terminalWidth: number;
   terminalHeight: number;
+  // Action feedback
+  lastAction: string;
+  lastActionTime: number;
 }
 
 export interface RenderContext {

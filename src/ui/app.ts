@@ -7,7 +7,6 @@ import {
   clearScreen,
   hideCursor,
   showCursor,
-  moveCursorHome,
   saveScreen,
   restoreScreen,
   getTerminalSize,
@@ -20,7 +19,7 @@ import {
   colors,
   STATUS,
   BOX,
-  writeLine,
+  renderFrame,
   enableMouseTracking,
   disableMouseTracking,
 } from './renderer';
@@ -34,12 +33,44 @@ const SCROLL_RAPID_THRESHOLD_MS = 50;
 const MOMENTUM_FRAME_INTERVAL_MS = 16;
 const MAX_SCROLL_VELOCITY = 30;
 
+// Action feedback duration
+const ACTION_FEEDBACK_MS = 1500;
+
+// Hebrew keyboard layout mapping (physical key position -> Hebrew character)
+// This allows the app to work regardless of keyboard language
+const HEBREW_TO_ENGLISH: Record<string, string> = {
+  'ח': 'j', 'ל': 'k', 'ב': 'c', 'ר': 'r', 'ך': 'l', 'כ': 'f',
+  'מ': 'n', 'ט': 'y', 'ש': 'a', 'ד': 's', 'ק': 'e', 'א': 't',
+  'ו': 'u', 'ן': 'i', 'ם': 'o', 'פ': 'p', 'ג': 'd', 'ע': 'g',
+  'י': 'h', 'ז': 'z', 'ס': 'x', 'ה': 'v', 'נ': 'b', 'צ': 'm',
+  '/': 'q', '.': '/', // Hebrew '/' is on 'q', and '.' can be used for search
+};
+
+/**
+ * Normalize a key to handle different keyboard layouts
+ */
+function normalizeKey(key: string): string {
+  // Check if it's a Hebrew character and map to English equivalent
+  if (HEBREW_TO_ENGLISH[key]) {
+    return HEBREW_TO_ENGLISH[key];
+  }
+  // For uppercase Hebrew (with Shift), check lowercase mapping
+  const lower = key.toLowerCase();
+  if (HEBREW_TO_ENGLISH[lower]) {
+    const mapped = HEBREW_TO_ENGLISH[lower];
+    // Preserve case
+    return key === lower ? mapped : mapped.toUpperCase();
+  }
+  return key;
+}
+
 export class TUIApp {
   private state: AppUIState;
   private running = false;
   private renderInterval?: Timer;
   private mouseTrackingEnabled = false;
   private momentumInterval?: Timer;
+  private feedbackTimeout?: Timer;
 
   constructor() {
     const { rows, cols } = getTerminalSize();
@@ -66,6 +97,8 @@ export class TUIApp {
       },
       terminalWidth: cols,
       terminalHeight: rows,
+      lastAction: '',
+      lastActionTime: 0,
     };
   }
 
@@ -148,6 +181,9 @@ export class TUIApp {
     if (this.momentumInterval) {
       clearInterval(this.momentumInterval);
     }
+    if (this.feedbackTimeout) {
+      clearTimeout(this.feedbackTimeout);
+    }
 
     // Kill all running processes before exiting
     if (processManager.isRunning()) {
@@ -161,6 +197,28 @@ export class TUIApp {
     }
     showCursor();
     restoreScreen();
+  }
+
+  /**
+   * Set action feedback message that will be displayed temporarily
+   */
+  private setAction(action: string): void {
+    this.state.lastAction = action;
+    this.state.lastActionTime = Date.now();
+
+    // Clear any existing timeout
+    if (this.feedbackTimeout) {
+      clearTimeout(this.feedbackTimeout);
+    }
+
+    // Set timeout to clear the feedback
+    this.feedbackTimeout = setTimeout(() => {
+      this.state.lastAction = '';
+      // Don't render if in SELECT mode - would disrupt text selection
+      if (!(this.state.viewMode === 'logs' && !this.state.logFollowMode)) {
+        this.render();
+      }
+    }, ACTION_FEEDBACK_MS);
   }
 
   private async loadProjectsWithGit(): Promise<void> {
@@ -190,8 +248,9 @@ export class TUIApp {
   }
 
   private updateMouseTracking(): void {
-    // Always enable mouse tracking in logs view for scroll wheel support
-    const shouldEnable = this.state.viewMode === 'logs';
+    // Only enable mouse tracking when follow mode is on for scroll wheel support
+    // Disable it when follow mode is off to allow text selection
+    const shouldEnable = this.state.viewMode === 'logs' && this.state.logFollowMode;
     if (shouldEnable && !this.mouseTrackingEnabled) {
       enableMouseTracking();
       this.mouseTrackingEnabled = true;
@@ -327,13 +386,26 @@ export class TUIApp {
           this.handleScrollWheel('down');
           return;
         }
+        // Left click (button 0) - switch to SELECT mode for text selection
+        if (mouseEvent.button === 0) {
+          this.stopMomentumScroll();
+          this.state.logFollowMode = false;
+          this.updateMouseTracking();
+          this.setAction('SELECT mode');
+          this.render();
+        }
       }
-      // Ignore other mouse events (clicks) - mouse tracking stays on for scroll
       return;
     }
 
+    // Normalize single-character keys for keyboard layout independence (e.g., Hebrew)
+    // Don't normalize escape sequences, control characters, or multi-char inputs
+    const normalizedKey = key.length === 1 && key.charCodeAt(0) > 31 && !key.startsWith('\x1b')
+      ? normalizeKey(key)
+      : key;
+
     // Handle Ctrl+C - always show quit confirmation
-    if (key === '\x03') {
+    if (normalizedKey === '\x03') {
       this.state.quitConfirmMode = true;
       this.render();
       return;
@@ -341,24 +413,25 @@ export class TUIApp {
 
     // Handle quit confirmation mode
     if (this.state.quitConfirmMode) {
-      await this.handleQuitConfirmKeypress(key);
+      await this.handleQuitConfirmKeypress(normalizedKey);
       this.updateMouseTracking();
       return;
     }
 
     if (this.state.searchMode) {
+      // Don't normalize in search mode - we want to type in any language
       await this.handleSearchKeypress(key);
       this.updateMouseTracking();
       return;
     }
 
     if (this.state.viewMode === 'logs') {
-      await this.handleLogKeypress(key);
+      await this.handleLogKeypress(normalizedKey);
       this.updateMouseTracking();
       return;
     }
 
-    await this.handleDashboardKeypress(key);
+    await this.handleDashboardKeypress(normalizedKey);
     this.updateMouseTracking();
   }
 
@@ -378,10 +451,13 @@ export class TUIApp {
   }
 
   private async handleDashboardKeypress(key: string): Promise<void> {
+    const project = this.state.projects[this.state.selectedProjectIndex];
+
     switch (key) {
       case '\x1b[A': // Up arrow
       case 'k':
         this.state.selectedProjectIndex = Math.max(0, this.state.selectedProjectIndex - 1);
+        this.setAction('↑ Navigate');
         break;
 
       case '\x1b[B': // Down arrow
@@ -390,37 +466,59 @@ export class TUIApp {
           this.state.projects.length - 1,
           this.state.selectedProjectIndex + 1
         );
+        this.setAction('↓ Navigate');
         break;
 
       // Number keys for quick project selection
       case '1':
-        if (this.state.projects.length >= 1) this.state.selectedProjectIndex = 0;
+        if (this.state.projects.length >= 1) {
+          this.state.selectedProjectIndex = 0;
+          this.setAction('Select #1');
+        }
         break;
       case '2':
-        if (this.state.projects.length >= 2) this.state.selectedProjectIndex = 1;
+        if (this.state.projects.length >= 2) {
+          this.state.selectedProjectIndex = 1;
+          this.setAction('Select #2');
+        }
         break;
       case '3':
-        if (this.state.projects.length >= 3) this.state.selectedProjectIndex = 2;
+        if (this.state.projects.length >= 3) {
+          this.state.selectedProjectIndex = 2;
+          this.setAction('Select #3');
+        }
         break;
 
       case '\r': // Enter - toggle start/stop for selected project
-        await this.toggleSelectedProject();
+        if (project) {
+          const wasRunning = processManager.isProjectRunning(project.alias);
+          await this.toggleSelectedProject();
+          this.setAction(wasRunning ? `Stopping ${project.alias}...` : `Starting ${project.alias}...`);
+        }
         break;
 
       case 'c':
         await this.toggleDopplerConfig();
+        this.setAction(`Config: ${this.state.appState.dopplerConfig}`);
         break;
 
       case 'r':
-        await this.restartSelectedProject();
+        if (project && processManager.isProjectRunning(project.alias)) {
+          await this.restartSelectedProject();
+          this.setAction(`Restarting ${project.alias}...`);
+        }
         break;
 
       case 'A': // Shift+A - Start all projects
+      case 'a': // Also accept lowercase (for Hebrew keyboard where Shift doesn't change case)
         await this.startAllProjects();
+        this.setAction('Starting all...');
         break;
 
       case 'S': // Shift+S - Stop all projects
+      case 's': // Also accept lowercase (for Hebrew keyboard where Shift doesn't change case)
         await this.stopAllProjects();
+        this.setAction('Stopping all...');
         break;
 
       case 'l':
@@ -428,6 +526,7 @@ export class TUIApp {
         this.state.selectedLogProject = this.state.selectedProjectIndex;
         this.state.logScrollOffset = 0;
         this.state.logFollowMode = true;
+        this.setAction('Logs view');
         break;
 
       case 'q':
@@ -448,6 +547,7 @@ export class TUIApp {
       case '\x1b': // Escape
         this.stopMomentumScroll();
         this.state.viewMode = 'dashboard';
+        this.setAction('Dashboard');
         break;
 
       case '\x1b[A': // Up arrow
@@ -473,6 +573,7 @@ export class TUIApp {
         this.stopMomentumScroll();
         this.state.logFollowMode = false;
         this.state.logScrollOffset = Math.max(0, this.state.logScrollOffset - viewHeight);
+        this.setAction('Page Up');
         break;
 
       case '\x1b[6~': // Page Down
@@ -484,37 +585,45 @@ export class TUIApp {
         if (this.state.logScrollOffset >= buffer.lines.length - viewHeight) {
           this.state.logFollowMode = true;
         }
+        this.setAction('Page Down');
         break;
 
       case '\x1b[D': // Left arrow - switch app
         this.state.selectedLogApp = Math.max(0, this.state.selectedLogApp - 1);
         this.state.logScrollOffset = 0;
         this.state.logFollowMode = true;
+        this.setAction(`← ${APPS[this.state.selectedLogApp].name}`);
         break;
 
       case '\x1b[C': // Right arrow - switch app
         this.state.selectedLogApp = Math.min(APPS.length - 1, this.state.selectedLogApp + 1);
         this.state.logScrollOffset = 0;
         this.state.logFollowMode = true;
+        this.setAction(`→ ${APPS[this.state.selectedLogApp].name}`);
         break;
 
       case '[': // Switch to previous project
         this.state.selectedLogProject = Math.max(0, this.state.selectedLogProject - 1);
         this.state.logScrollOffset = 0;
         this.state.logFollowMode = true;
+        this.setAction(`[ ${this.state.projects[this.state.selectedLogProject]?.alias || ''}`);
         break;
 
       case ']': // Switch to next project
         this.state.selectedLogProject = Math.min(this.state.projects.length - 1, this.state.selectedLogProject + 1);
         this.state.logScrollOffset = 0;
         this.state.logFollowMode = true;
+        this.setAction(`] ${this.state.projects[this.state.selectedLogProject]?.alias || ''}`);
         break;
 
       case 'f':
         this.state.logFollowMode = !this.state.logFollowMode;
         if (this.state.logFollowMode) {
           this.state.logScrollOffset = Math.max(0, buffer.lines.length - viewHeight);
+        } else {
+          this.stopMomentumScroll();
         }
+        this.setAction(this.state.logFollowMode ? 'Follow ON' : 'Follow OFF');
         break;
 
       case '/':
@@ -529,6 +638,7 @@ export class TUIApp {
           this.state.searchMatchIndex =
             (this.state.searchMatchIndex + 1) % this.state.searchMatches.length;
           this.scrollToSearchMatch();
+          this.setAction(`Match ${this.state.searchMatchIndex + 1}/${this.state.searchMatches.length}`);
         }
         break;
 
@@ -538,11 +648,15 @@ export class TUIApp {
             (this.state.searchMatchIndex - 1 + this.state.searchMatches.length) %
             this.state.searchMatches.length;
           this.scrollToSearchMatch();
+          this.setAction(`Match ${this.state.searchMatchIndex + 1}/${this.state.searchMatches.length}`);
         }
         break;
 
       case 'r':
-        await this.restartSelectedApp();
+        if (currentProject) {
+          await this.restartSelectedApp();
+          this.setAction(`Restarting ${APPS[this.state.selectedLogApp].name}...`);
+        }
         break;
 
       case 'q':
@@ -689,7 +803,6 @@ export class TUIApp {
   private render(): void {
     if (!this.running) return;
 
-    moveCursorHome();
     let lines: string[];
 
     if (this.state.quitConfirmMode) {
@@ -700,9 +813,8 @@ export class TUIApp {
       lines = this.renderLogViewer();
     }
 
-    for (const line of lines) {
-      writeLine(line);
-    }
+    // Render entire frame in one write to prevent flickering
+    renderFrame(lines);
   }
 
   private renderQuitConfirmation(): string[] {
@@ -889,17 +1001,27 @@ export class TUIApp {
 
     // Help bar
     lines.push(drawHorizontalLine(width));
-    const helpText = [
+    const helpItems = [
       `${colors.key('[1-3]')} Select`,
       `${colors.key('[Enter]')} Toggle`,
-      `${colors.key('[A]')} Start All`,
-      `${colors.key('[S]')} Stop All`,
+      `${colors.key('[a]')} Start All`,
+      `${colors.key('[s]')} Stop All`,
       `${colors.key('[c]')} Config`,
       `${colors.key('[r]')} Restart`,
       `${colors.key('[l]')} Logs`,
       `${colors.key('[q]')} Quit`,
     ].join('  ');
-    lines.push(`${BOX.vertical} ${padString(helpText, width - 4)} ${BOX.vertical}`);
+
+    // Show action feedback if recent
+    const actionFeedback = this.state.lastAction && (Date.now() - this.state.lastActionTime < ACTION_FEEDBACK_MS)
+      ? colors.info(`▸ ${this.state.lastAction}`)
+      : '';
+    const helpPadding = width - stripAnsi(helpItems).length - stripAnsi(actionFeedback).length - 4;
+    const helpLine = actionFeedback
+      ? `${helpItems}${' '.repeat(Math.max(1, helpPadding))}${actionFeedback}`
+      : helpItems;
+
+    lines.push(`${BOX.vertical} ${padString(helpLine, width - 4)} ${BOX.vertical}`);
     lines.push(drawBoxBottom(width));
 
     return lines;
@@ -924,7 +1046,7 @@ export class TUIApp {
     const title = colors.title(`  LOGS: ${projectName} › ${app.name}`) + colors.dim(` (${configName})`);
     const projectIndicator = `[${this.state.selectedLogProject + 1}/${this.state.projects.length}]`;
     const appIndicator = `[${this.state.selectedLogApp + 1}/${APPS.length}]`;
-    const followIndicator = this.state.logFollowMode ? colors.success('FOLLOW ●') : '';
+    const followIndicator = this.state.logFollowMode ? colors.success('FOLLOW ●') : colors.dim('SELECT');
     const searchIndicator = this.state.searchMode
       ? `Search: ${this.state.searchQuery}▌`
       : this.state.searchQuery
@@ -966,7 +1088,7 @@ export class TUIApp {
 
     // Help bar
     lines.push(drawHorizontalLine(width));
-    const helpText = this.state.searchMode
+    const helpItems = this.state.searchMode
       ? `${colors.key('[Enter]')} Confirm  ${colors.key('[Esc]')} Cancel`
       : [
           `${colors.key('[[/]]')} Project`,
@@ -978,7 +1100,17 @@ export class TUIApp {
           `${colors.key('[r]')} Restart`,
           `${colors.key('[Esc]')} Back`,
         ].join('  ');
-    lines.push(`${BOX.vertical} ${padString(helpText, width - 4)} ${BOX.vertical}`);
+
+    // Show action feedback if recent
+    const actionFeedback = this.state.lastAction && (Date.now() - this.state.lastActionTime < ACTION_FEEDBACK_MS)
+      ? colors.info(`▸ ${this.state.lastAction}`)
+      : '';
+    const helpPadding = width - stripAnsi(helpItems).length - stripAnsi(actionFeedback).length - 4;
+    const helpLine = actionFeedback
+      ? `${helpItems}${' '.repeat(Math.max(1, helpPadding))}${actionFeedback}`
+      : helpItems;
+
+    lines.push(`${BOX.vertical} ${padString(helpLine, width - 4)} ${BOX.vertical}`);
     lines.push(drawBoxBottom(width));
 
     return lines;

@@ -142,6 +142,9 @@ export const STATUS = {
   error: chalk.red('✖'),
 };
 
+// Clear to end of line escape code
+export const CLEAR_EOL = `${CSI}K`;
+
 // Write to stdout without newline
 export function write(str: string): void {
   process.stdout.write(str);
@@ -159,4 +162,15 @@ export function redraw(lines: string[]): void {
     clearLine();
     writeLine(line);
   }
+}
+
+/**
+ * Render all lines in a single write to prevent flickering.
+ * Each line is followed by clear-to-end-of-line to remove any leftover content.
+ */
+export function renderFrame(lines: string[]): void {
+  // Build entire frame as single string
+  // Move cursor home, then each line clears to EOL
+  const frame = `${CSI}H` + lines.map(line => line + CLEAR_EOL).join('\n') + '\n';
+  process.stdout.write(frame);
 }
